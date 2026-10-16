@@ -68,8 +68,8 @@ def _all_gather_into_tensor(
     sp_world_size = dist.get_world_size(group)
     dim = dim % len(dim_size)
     dim_size[dim] = dim_size[dim] * sp_world_size
-    output = torch.empty(dim_size, dtype=x.dtype, device=get_device_id())
     if dim == 0:
+        output = torch.empty(dim_size, dtype=x.dtype, device=get_device_id())
         dist.all_gather_into_tensor(output, x.contiguous(), group=group)
     else:
         x_contig = x.movedim(dim, 0).contiguous()

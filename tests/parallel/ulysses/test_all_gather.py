@@ -1,6 +1,7 @@
 from datetime import timedelta
 from itertools import product
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -8,7 +9,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
+from veomni.distributed.sequence_parallel import ulysses
+from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor, slice_input_tensor_scale_grad
 from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
 from veomni.distributed.sequence_parallel.ulysses import _all_gather, _Gather
 from veomni.utils.device import (
@@ -150,6 +152,53 @@ class AllToAllCommTest(SequenceParallelTest):
 
         torch.testing.assert_close(loss_ref, loss_sp, rtol=1e-8, atol=1e-8)
         torch.testing.assert_close(grad_ref, grad_sp, rtol=1e-8, atol=1e-8)
+
+
+def _check_slice_backward(rank, init_method, backend):
+    device = "cpu"
+    if backend in (dist.Backend.NCCL, "hccl"):
+        get_torch_device().set_device(rank)
+        device = get_device_type()
+    dist.init_process_group(backend, init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=45))
+    try:
+        for dim, scale_grad, layout in product((0, 1, -2), (False, True), ("contiguous", "transposed", "expanded")):
+            case = f"{backend=}, {rank=}, {dim=}, {scale_grad=}, {layout=}"
+            full = torch.arange(48, dtype=torch.float32, device=device).reshape(4, 4, 3).requires_grad_()
+            local = slice_input_tensor_scale_grad(full, dim=dim, group=dist.group.WORLD, scale_grad=scale_grad)
+            torch.testing.assert_close(local, full.chunk(2, dim=dim)[rank], rtol=0, atol=0, msg=case)
+            values = torch.arange(local.numel(), dtype=full.dtype, device=device).reshape(local.shape)
+            if layout == "expanded":
+                upstream = torch.tensor(float(rank + 1), device=device).expand(local.shape)
+                rank_grads = [torch.full_like(values, float(i + 1)) for i in range(2)]
+            else:
+                upstream = values + rank * 100
+                if layout == "transposed":
+                    upstream = upstream.transpose(0, 1).contiguous().transpose(0, 1)
+                rank_grads = [values + i * 100 for i in range(2)]
+            expected = torch.cat(rank_grads, dim=dim)
+            if scale_grad:
+                expected = expected / 2
+
+            # Gloo uses CPU tensors even on hosts with an accelerator. Keep the
+            # real collective and public autograd path, changing only its device.
+            with patch.object(ulysses, "get_device_id", return_value=device):
+                with patch.object(torch, "empty", wraps=torch.empty) as allocations:
+                    (actual,) = torch.autograd.grad(local, full, grad_outputs=upstream)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=case)
+            # The nonzero-dimension path needs one collective output, not an
+            # additional unused full gathered buffer retained during the gather.
+            assert allocations.call_count == 1, case
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("backend", _SHARED_GRADIENT_BACKENDS)
+def test_slice_backward_dimensions_scaling_and_allocations(tmp_path, backend):
+    mp.spawn(
+        _check_slice_backward,
+        args=((tmp_path / "rendezvous").as_uri(), backend),
+        nprocs=2,
+    )
 
 
 def _check_gather_backward(rank, init_method, backend):
